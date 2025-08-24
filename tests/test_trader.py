@@ -7,6 +7,7 @@ import time
 import json
 import os
 import tempfile
+import asyncio
 
 # 导入被测试的模块
 from trader import GridTrader
@@ -132,7 +133,7 @@ class TestStateManagement:
             mock_trader.last_grid_adjust_time = time.time()
             
             # 保存状态
-            mock_trader._save_state()
+            asyncio.run(mock_trader._save_state())
             
             # 验证文件存在
             assert os.path.exists(state_file)
@@ -164,7 +165,7 @@ class TestStateManagement:
         mock_trader.state_file_path = '/invalid/path/state.json'
         
         # 应该不抛出异常，但会记录错误日志
-        mock_trader._save_state()
+        asyncio.run(mock_trader._save_state())
 
 
 class TestConfigValidation:

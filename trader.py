@@ -11,6 +11,8 @@ import math
 from helpers import send_pushplus_message, format_trade_message
 import json
 import os
+import aiofiles
+import aiofiles.os
 from monitor import TradingMonitor
 from position_controller_s1 import PositionControllerS1
 
@@ -76,11 +78,10 @@ class GridTrader:
         self.monitor = TradingMonitor(self)  # 初始化monitor
         self.balance_check_interval = 60  # 每60秒检查一次余额
         self.last_balance_check = 0
-        self.funding_balance_cache = {
-            'timestamp': 0,
-            'data': {}
-        }
-        self.funding_cache_ttl = 60  # 理财余额缓存60秒
+        self.balance_cache_ttl = 60  # 余额缓存TTL
+        self.latest_spot_balance = {'timestamp': 0, 'data': {}}
+        self.latest_funding_balance = {'timestamp': 0, 'data': {}}
+        self._order_amount_cache = {"value": None, "timestamp": 0, "last": None}
         self.position_controller_s1 = PositionControllerS1(self)
 
         # 独立的监测状态变量，避免买入和卖出监测相互干扰
@@ -95,8 +96,8 @@ class GridTrader:
         state_filename = f"trader_state_{self.symbol.replace('/', '_')}.json"
         self.state_file_path = os.path.join(os.path.dirname(__file__), 'data', state_filename)
 
-    def _save_state(self):
-        """【重构后】以原子方式安全地保存当前核心策略状态到文件"""
+    async def _save_state(self):
+        """以原子方式异步保存当前核心策略状态到文件"""
         state = {
             'base_price': self.base_price,
             'grid_size': self.grid_size,
@@ -120,15 +121,12 @@ class GridTrader:
         temp_file_path = self.state_file_path + ".tmp"
 
         try:
-            # 确保目录存在
             os.makedirs(os.path.dirname(self.state_file_path), exist_ok=True)
 
-            # 1. 写入临时文件
-            with open(temp_file_path, 'w', encoding='utf-8') as f:
-                json.dump(state, f, indent=2, ensure_ascii=False)
+            async with aiofiles.open(temp_file_path, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps(state, indent=2, ensure_ascii=False))
 
-            # 2. 原子性地重命名临时文件为正式文件
-            os.rename(temp_file_path, self.state_file_path)
+            await aiofiles.os.rename(temp_file_path, self.state_file_path)
 
             self.logger.info(f"核心状态已安全保存。基准价: {self.base_price:.2f}, 网格: {self.grid_size:.2f}%")
 
@@ -136,7 +134,6 @@ class GridTrader:
             self.logger.error(f"保存核心状态失败: {e}")
 
         finally:
-            # 3. 确保临时文件在任何情况下都被删除
             if os.path.exists(temp_file_path):
                 try:
                     os.remove(temp_file_path)
@@ -471,54 +468,45 @@ class GridTrader:
         return False
 
     async def _calculate_order_amount(self, order_type):
-        """计算目标订单金额 (总资产的10%)\n"""
+        """计算目标订单金额 (总资产的10%)"""
         try:
+            cache = self._order_amount_cache
             current_time = time.time()
 
-            # 使用缓存避免频繁计算和日志输出
-            cache_key = f'order_amount_target'  # 使用不同的缓存键
-            if hasattr(self, cache_key) and \
-                    current_time - getattr(self, f'{cache_key}_time') < 60:  # 1分钟缓存
-                return getattr(self, cache_key)
+            if cache["value"] is not None and current_time - cache["timestamp"] < 60:
+                return cache["value"]
 
             total_assets = await self._get_pair_specific_assets_value()
-
-            # 目标金额严格等于总资产的10%
             amount = total_assets * 0.1
 
-            # 只在金额变化超过1%时记录日志
-            # 使用 max(..., 0.01) 避免除以零错误
-            if not hasattr(self, f'{cache_key}_last') or \
-                    abs(amount - getattr(self, f'{cache_key}_last', 0)) / max(getattr(self, f'{cache_key}_last', 0.01),
-                                                                              0.01) > 0.01:
+            if cache["last"] is None or abs(amount - cache["last"]) / max(cache["last"], 0.01) > 0.01:
                 self.logger.info(
                     f"目标订单金额计算 | "
                     f"交易对相关资产: {total_assets:.2f} {self.quote_asset} | "
                     f"计算金额 (10%): {amount:.2f} {self.quote_asset}"
                 )
-                setattr(self, f'{cache_key}_last', amount)
+                cache["last"] = amount
 
-            # 更新缓存
-            setattr(self, cache_key, amount)
-            setattr(self, f'{cache_key}_time', current_time)
+            cache["value"] = amount
+            cache["timestamp"] = current_time
 
             return amount
 
         except Exception as e:
             self.logger.error(f"计算目标订单金额失败: {str(e)}")
-            # 返回一个合理的默认值或上次缓存值，避免返回0导致后续计算错误
-            return getattr(self, cache_key, 0)  # 如果缓存存在则返回缓存，否则返回0
+            return self._order_amount_cache.get("value", 0) or 0
 
     async def get_available_balance(self, currency):
         balance = await self.exchange.fetch_balance({'type': 'spot'})
         return balance.get('free', {}).get(currency, 0) * settings.SAFETY_MARGIN
 
-    async def _calculate_dynamic_interval_seconds(self):
+    async def _calculate_dynamic_interval_seconds(self, volatility=None):
         """根据波动率动态计算网格调整的时间间隔（秒）"""
         try:
-            volatility = await self._calculate_volatility()
-            if volatility is None:  # Handle case where volatility calculation failed
-                raise ValueError("波动率计算失败")  # Volatility calculation failed
+            if volatility is None:
+                volatility = await self._calculate_volatility()
+            if volatility is None:
+                raise ValueError("波动率计算失败")
 
             interval_rules = TradingConfig.DYNAMIC_INTERVAL_PARAMS['volatility_to_interval_hours']
             default_interval_hours = TradingConfig.DYNAMIC_INTERVAL_PARAMS['default_interval_hours']
@@ -570,8 +558,12 @@ class GridTrader:
                 self.current_price = current_price
 
                 # ========== 新增：获取本轮循环的统一账户快照 ==========
-                spot_balance = await self.exchange.fetch_balance()
-                funding_balance = await self.exchange.fetch_funding_balance()
+                spot_task = self.exchange.fetch_balance()
+                funding_task = self.exchange.fetch_funding_balance()
+                spot_balance, funding_balance = await asyncio.gather(spot_task, funding_task)
+                now = time.time()
+                self.latest_spot_balance = {'timestamp': now, 'data': spot_balance}
+                self.latest_funding_balance = {'timestamp': now, 'data': funding_balance}
                 # ========== 新增结束 ==========
 
                 # --- 核心理念：维护任务与交易任务分离 ---
@@ -584,13 +576,12 @@ class GridTrader:
                 await self.position_controller_s1.update_daily_s1_levels()
 
                 # 2. 检查是否需要调整网格大小 (包含波动率计算)
-                # 这个任务现在独立运行，不再被交易状态阻塞
-                dynamic_interval_seconds = await self._calculate_dynamic_interval_seconds()
+                volatility = await self._calculate_volatility()
+                dynamic_interval_seconds = await self._calculate_dynamic_interval_seconds(volatility)
                 if time.time() - self.last_grid_adjust_time > dynamic_interval_seconds:
                     self.logger.info(
                         f"维护时间到达，准备更新波动率并调整网格 (间隔: {dynamic_interval_seconds / 3600:.2f} 小时).")
-                    # adjust_grid_size 内部会调用 _calculate_volatility
-                    await self.adjust_grid_size()
+                    await self.adjust_grid_size(volatility)
                     self.last_grid_adjust_time = time.time() # 更新时间戳
 
                 # ------------------------------------------------------------------
@@ -769,7 +760,7 @@ class GridTrader:
         self.logger.info(f"基准价已更新: {self.base_price}")
 
         # 保存状态
-        self._save_state()
+        await self._save_state()
 
         # 5) 推送通知
         msg = format_trade_message(
@@ -822,9 +813,20 @@ class GridTrader:
                 # 调整价格精度
                 order_price = self._adjust_price_precision(order_price)
 
-                # 检查余额是否足够 - 需要获取最新的余额信息
-                spot_balance = await self.exchange.fetch_balance({'type': 'spot'})
-                funding_balance = await self.exchange.fetch_funding_balance()
+                # 检查余额是否足够 - 使用缓存并在必要时刷新
+                current_time = time.time()
+                if current_time - self.latest_spot_balance['timestamp'] > self.balance_cache_ttl:
+                    self.latest_spot_balance = {
+                        'timestamp': current_time,
+                        'data': await self.exchange.fetch_balance()
+                    }
+                if current_time - self.latest_funding_balance['timestamp'] > self.balance_cache_ttl:
+                    self.latest_funding_balance = {
+                        'timestamp': current_time,
+                        'data': await self.exchange.fetch_funding_balance()
+                    }
+                spot_balance = self.latest_spot_balance['data']
+                funding_balance = self.latest_funding_balance['data']
 
                 if not await self._ensure_balance_for_trade(side, spot_balance, funding_balance):
                     self.logger.warning(f"{side}余额不足，第 {retry_count + 1} 次尝试中止")
@@ -1118,11 +1120,12 @@ class GridTrader:
                         await asyncio.sleep(1)
                         continue
 
-    async def adjust_grid_size(self):
+    async def adjust_grid_size(self, volatility=None):
         """根据【平滑后】的波动率和市场趋势调整网格大小"""
         try:
-            # 1. 计算当前的瞬时波动率
-            current_volatility = await self._calculate_volatility()
+            current_volatility = volatility
+            if current_volatility is None:
+                current_volatility = await self._calculate_volatility()
             if current_volatility is None:
                 self.logger.warning("无法计算当前波动率，跳过网格调整。")
                 return
@@ -1177,7 +1180,7 @@ class GridTrader:
                 self.grid_size = new_grid
                 self.last_grid_adjust_time = time.time()  # 更新时间
                 # 保存状态
-                self._save_state()
+                await self._save_state()
 
         except Exception as e:
             self.logger.error(f"调整网格大小失败: {str(e)}")
@@ -1748,8 +1751,18 @@ class GridTrader:
             # 设置一个默认返回值，以防发生异常
             default_total = self._assets_cache['value'] if hasattr(self, '_assets_cache') else 0
 
-            balance = await self.exchange.fetch_balance()
-            funding_balance = await self.exchange.fetch_funding_balance()
+            if current_time - self.latest_spot_balance['timestamp'] > self.balance_cache_ttl:
+                self.latest_spot_balance = {
+                    'timestamp': current_time,
+                    'data': await self.exchange.fetch_balance()
+                }
+            if current_time - self.latest_funding_balance['timestamp'] > self.balance_cache_ttl:
+                self.latest_funding_balance = {
+                    'timestamp': current_time,
+                    'data': await self.exchange.fetch_funding_balance()
+                }
+            balance = self.latest_spot_balance['data']
+            funding_balance = self.latest_funding_balance['data']
             current_price = await self._get_latest_price()
 
             # 防御性检查：确保返回的价格是有效的
