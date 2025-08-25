@@ -92,6 +92,11 @@ class GridTrader:
         self.volatility_history = []  # 用于存储最近的波动率值
         self.volatility_smoothing_window = 3  # 平滑窗口大小，取最近3次的平均值
 
+        # 【新增】趋势检测参数
+        self.short_ma_period = 20   # 短期均线周期
+        self.long_ma_period = 50    # 长期均线周期
+        self.trend_threshold = 0.01 # 趋势判定阈值（1%）
+
         # 状态持久化相关 - 状态文件名与交易对挂钩
         state_filename = f"trader_state_{self.symbol.replace('/', '_')}.json"
         self.state_file_path = os.path.join(os.path.dirname(__file__), 'data', state_filename)
@@ -298,7 +303,13 @@ class GridTrader:
         try:
             ticker = await self.exchange.fetch_ticker(self.symbol)
             if ticker and 'last' in ticker:
-                return ticker['last']
+                price = ticker['last']
+                # 记录价格用于趋势检测
+                self.price_history.append(price)
+                max_len = max(self.long_ma_period, self.short_ma_period) * 3
+                if len(self.price_history) > max_len:
+                    self.price_history = self.price_history[-max_len:]
+                return price
             self.logger.error("获取价格失败: 返回数据格式不正确")
             return self.base_price
         except Exception as e:
@@ -322,6 +333,24 @@ class GridTrader:
             )
         self.highest = None
         self.lowest = None
+
+    def _detect_trend(self):
+        """根据价格历史判断市场趋势"""
+        if len(self.price_history) < self.long_ma_period:
+            return 'sideways'
+
+        short_ma = np.mean(self.price_history[-self.short_ma_period:])
+        long_ma = np.mean(self.price_history[-self.long_ma_period:])
+        if long_ma == 0:
+            return 'sideways'
+
+        diff_ratio = (short_ma - long_ma) / long_ma
+        if diff_ratio > self.trend_threshold:
+            return 'uptrend'
+        elif diff_ratio < -self.trend_threshold:
+            return 'downtrend'
+        else:
+            return 'sideways'
 
     async def _sync_recent_trades(self, limit: int = 50):
         """
@@ -409,6 +438,10 @@ class GridTrader:
             # 触发买入的逻辑保持不变
             threshold = FLIP_THRESHOLD(self.grid_size)
             if self.lowest and current_price >= self.lowest * (1 + threshold):
+                # 趋势过滤：在明显下行趋势中忽略买入信号
+                if self._detect_trend() == 'downtrend':
+                    self.logger.info("下行趋势检测到，忽略买入信号")
+                    return False
                 self.is_monitoring_buy = False # 准备交易，退出监测
                 self.logger.info(
                     f"触发买入信号 | 当前价: {current_price:.2f} | 已反弹: {(current_price / self.lowest - 1) * 100:.2f}%")
@@ -453,6 +486,10 @@ class GridTrader:
             # 触发卖出的逻辑保持不变
             threshold = FLIP_THRESHOLD(self.grid_size)
             if self.highest and current_price <= self.highest * (1 - threshold):
+                # 趋势过滤：在明显上行趋势中忽略卖出信号
+                if self._detect_trend() == 'uptrend':
+                    self.logger.info("上行趋势检测到，忽略卖出信号")
+                    return False
                 self.is_monitoring_sell = False  # 准备交易，退出监测
                 self.logger.info(
                     f"触发卖出信号 | 当前价: {current_price:.2f} | 目标价: {self.highest * (1 - threshold):.5f} | 已下跌: {(1 - current_price / self.highest) * 100:.2f}%")
