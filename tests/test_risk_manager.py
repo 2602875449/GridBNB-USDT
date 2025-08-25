@@ -3,8 +3,10 @@
 """
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
+import pytest
 
 from risk_manager import AdvancedRiskManager, RiskState
+from trend_detector import Trend
 from config import TradingConfig
 
 
@@ -167,6 +169,21 @@ class TestAdvancedRiskManager:
         
         # 验证日志调用（使用risk_manager自己的logger）
         assert risk_manager.logger.info.called
+
+    @pytest.mark.asyncio
+    async def test_trend_override(self, risk_manager):
+        """趋势信号应当覆盖仓位限制的默认结果"""
+        risk_manager._get_position_ratio = AsyncMock(return_value=0.5)
+        mock_spot_balance = {'free': {'BNB': 1.0, 'USDT': 1000.0}}
+        mock_funding_balance = {'BNB': 0.0, 'USDT': 0.0}
+
+        risk_manager.set_trend(Trend.UP)
+        result = await risk_manager.check_position_limits(mock_spot_balance, mock_funding_balance)
+        assert result == RiskState.ALLOW_BUY_ONLY
+
+        risk_manager.set_trend(Trend.DOWN)
+        result = await risk_manager.check_position_limits(mock_spot_balance, mock_funding_balance)
+        assert result == RiskState.ALLOW_SELL_ONLY
 
 
 class TestRiskStateIntegration:
