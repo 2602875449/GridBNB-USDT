@@ -180,5 +180,17 @@ class TestConfigValidation:
         assert config.GRID_PARAMS['min'] <= config.GRID_PARAMS['max']
 
 
+class TestTrendDetection:
+    """测试趋势检测功能"""
+
+    def test_detect_trend_up(self, mock_trader):
+        mock_trader.price_history = list(range(100, 200))
+        assert mock_trader._detect_trend() == 'uptrend'
+
+    def test_detect_trend_down(self, mock_trader):
+        mock_trader.price_history = list(range(200, 100, -1))
+        assert mock_trader._detect_trend() == 'downtrend'
+
+
 if __name__ == '__main__':
     pytest.main([__file__])
