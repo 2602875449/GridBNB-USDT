@@ -1,6 +1,7 @@
 import logging
 import enum
 from config import settings
+from trend_detector import Trend
 
 
 class RiskState(enum.Enum):
@@ -17,11 +18,17 @@ class AdvancedRiskManager:
         # 初始化日志状态标记
         self._min_limit_warning_logged = False
         self._max_limit_warning_logged = False
+        # 当前市场趋势（默认为中性）
+        self._trend = Trend.NEUTRAL
+
+    def set_trend(self, trend: Trend) -> None:
+        """外部设置当前市场趋势"""
+        self._trend = trend
     
     async def check_position_limits(self, spot_balance, funding_balance) -> RiskState:
         """检查仓位限制并返回相应的风险状态，同时控制日志频率"""
         try:
-            position_ratio = await self._get_position_ratio(spot_balance, funding_balance) # 传递参数
+            position_ratio = await self._get_position_ratio(spot_balance, funding_balance)
 
             # 保存上次的仓位比例
             if not hasattr(self, 'last_position_ratio'):
@@ -37,45 +44,45 @@ class AdvancedRiskManager:
                 )
                 self.last_position_ratio = position_ratio
 
+            # 默认状态
+            state = RiskState.ALLOW_ALL
+
             # 检查仓位是否超限 (> 90%)
             if position_ratio > settings.MAX_POSITION_RATIO:
-                # 只有在没打印过日志时才打印
                 if not self._max_limit_warning_logged:
                     self.logger.warning(f"仓位超限 ({position_ratio:.2%})，暂停新的买入操作。")
-                    self._max_limit_warning_logged = True  # 标记为已打印
-
-                # 无论是否打印日志，都要重置另一个标记
+                    self._max_limit_warning_logged = True
                 self._min_limit_warning_logged = False
-                return RiskState.ALLOW_SELL_ONLY
+                state = RiskState.ALLOW_SELL_ONLY
 
             # 检查是否触发底仓保护 (< 10%)
             elif position_ratio < settings.MIN_POSITION_RATIO:
-                # 只有在没打印过日志时才打印
                 if not self._min_limit_warning_logged:
                     self.logger.warning(f"底仓保护触发 ({position_ratio:.2%})，暂停新的卖出操作。")
-                    self._min_limit_warning_logged = True  # 标记为已打印
-
-                # 无论是否打印日志，都要重置另一个标记
+                    self._min_limit_warning_logged = True
                 self._max_limit_warning_logged = False
-                return RiskState.ALLOW_BUY_ONLY
+                state = RiskState.ALLOW_BUY_ONLY
 
-            # 如果仓位在安全范围内 (10% ~ 90%)
             else:
-                # 如果之前有警告，现在恢复正常了，就打印一条恢复信息
                 if self._min_limit_warning_logged or self._max_limit_warning_logged:
                     self.logger.info(f"仓位已恢复至正常范围 ({position_ratio:.2%})。")
-
-                # 将所有日志标记重置为False
                 self._min_limit_warning_logged = False
                 self._max_limit_warning_logged = False
-                return RiskState.ALLOW_ALL
+                state = RiskState.ALLOW_ALL
+
+            # 根据趋势调整最终状态
+            if self._trend == Trend.UP and state != RiskState.ALLOW_SELL_ONLY:
+                state = RiskState.ALLOW_BUY_ONLY
+            elif self._trend == Trend.DOWN and state != RiskState.ALLOW_BUY_ONLY:
+                state = RiskState.ALLOW_SELL_ONLY
+
+            return state
 
         except Exception as e:
             self.logger.error(f"风控检查失败: {str(e)}")
-            # 在异常情况下也重置标记，以防状态锁死
             self._min_limit_warning_logged = False
             self._max_limit_warning_logged = False
-            return RiskState.ALLOW_ALL  # 出现异常时，默认为允许所有操作以避免卡死
+            return RiskState.ALLOW_ALL
 
     # 保留原方法以保持向后兼容性
     async def multi_layer_check(self):

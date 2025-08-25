@@ -2,6 +2,7 @@ from config import TradingConfig, FLIP_THRESHOLD, settings
 from exchange_client import ExchangeClient
 from order_tracker import OrderTracker, OrderThrottler
 from risk_manager import AdvancedRiskManager, RiskState
+from trend_detector import TrendDetector, Trend
 import logging
 import asyncio
 import numpy as np
@@ -83,6 +84,9 @@ class GridTrader:
         self.latest_funding_balance = {'timestamp': 0, 'data': {}}
         self._order_amount_cache = {"value": None, "timestamp": 0, "last": None}
         self.position_controller_s1 = PositionControllerS1(self)
+        # 趋势检测器，用于识别行情方向
+        self.trend_detector = TrendDetector()
+        self.last_trend = Trend.NEUTRAL
 
         # 独立的监测状态变量，避免买入和卖出监测相互干扰
         self.is_monitoring_buy = False   # 是否在监测买入机会
@@ -556,6 +560,14 @@ class GridTrader:
                     await asyncio.sleep(5)
                     continue
                 self.current_price = current_price
+
+                # 更新趋势并同步到风控模块
+                self.trend_detector.update(current_price)
+                trend = self.trend_detector.get_trend()
+                if trend != self.last_trend:
+                    self.logger.info(f"趋势更新: {trend.name}")
+                    self.last_trend = trend
+                self.risk_manager.set_trend(trend)
 
                 # ========== 新增：获取本轮循环的统一账户快照 ==========
                 spot_task = self.exchange.fetch_balance()
